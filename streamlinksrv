@@ -1,0 +1,1179 @@
+#!/usr/bin/python3
+#
+# Linux Python2/3 Streamlink Daemon
+#
+# Copyright (c) 2017 - 2021 Billy2011 @vuplus-support.org
+# Copyright (c) 2021 jbleyel (python3 mod)
+# License: GPLv2+
+#
+
+__version__ = "1.8.3"
+__optparserversion__ = "0.3.0"
+
+import argparse
+import atexit
+import errno
+import logging
+import os
+import platform
+import re
+import shutil
+import signal
+import socket
+import sys
+import time
+import traceback
+import warnings
+
+from platform import node as hostname
+from requests import __version__ as requests_version
+from six import itervalues, iteritems
+from six.moves.urllib_parse import unquote
+from websocket import __version__ as websocket_version
+
+from shlex import split as argsplit
+from string import printable
+from textwrap import dedent
+from contextlib import contextmanager
+from collections import OrderedDict
+
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ForkingMixIn
+
+
+try:
+    from socks import __version__ as socks_version
+except ImportError:
+    socks_version = "N/A"
+
+import streamlink.logger as logger
+from streamlink import PluginError, NoStreamsError, NoPluginError, StreamError
+from streamlink import Streamlink
+from streamlink import plugins
+from streamlink.exceptions import FatalPluginError
+from streamlink import __version__ as streamlink_version
+from streamlink.options import Options
+from streamlink.utils.args import comma_list, comma_list_filter, filesize, keyvalue, num
+from streamlink.utils.times import hours_minutes_seconds
+from streamlink.stream import HTTPStream
+from streamlink.stream.ffmpegmux import MuxedStream
+
+
+try:
+    from youtube_dl.version import __version__ as ytdl_version
+except ImportError:
+    ytdl_version = "N/A"
+
+PORT_NUMBER = 8088  # change it to 88 for livestreamersrv compatibility
+_loglevel = LOGLEVEL = "info"  # "critical", "error", "warning", "info", "debug", "trace" or "none"
+
+# do not change
+LOGGER = logging.getLogger("streamlink.streamlinksrv")
+STREAM_SYNONYMS = ["best", "worst", "best-unfiltered", "worst-unfiltered"]
+PARSER = None
+PLUGIN_ARGS = False
+
+STREAM_PASSTHROUGH = ["hls", "http", "hls-multi", "dash"]
+XDG_CONFIG_HOME = "/home/root/.config"
+XDG_STATE_HOME = "/home/root/.local/state"
+CONFIG_FILES = [
+    os.path.expanduser(XDG_CONFIG_HOME + "/streamlink/config"),
+    os.path.expanduser(XDG_CONFIG_HOME + "/.streamlinkrc")
+]
+PLUGINS_DIR = os.path.expanduser(XDG_CONFIG_HOME + "/streamlink/plugins")
+LOG_DIR = os.path.expanduser(XDG_STATE_HOME + "/streamlink/logs")
+
+_printable_re = re.compile(r"[{0}]".format(printable))
+_option_re = re.compile(r"""
+    (?P<name>[\w-]+) # A option name, valid characters are A to z and dash.
+    \s*
+    (?P<op>=)? # Separating the option and the value with a equals sign is
+               # common, but optional.
+    \s*
+    (?P<value>.*) # The value, anything goes.
+""", re.VERBOSE)
+DEFAULT_LEVEL = "info"
+
+
+@contextmanager
+def ignored(*exceptions):
+    try:
+        yield
+    except exceptions:
+        pass
+
+
+def resolve_stream_name(streams, stream_name):
+    if stream_name in STREAM_SYNONYMS and stream_name in streams:
+        for name, stream in iteritems(streams):
+            if stream is streams[stream_name] and name not in STREAM_SYNONYMS:
+                return name
+
+    return stream_name
+
+
+def format_valid_streams(plugin, streams):
+    delimiter = ", "
+    validstreams = []
+
+    for name, stream in sorted(iteritems(streams), key=lambda stream: plugin.stream_weight(stream[0])):
+        if name in STREAM_SYNONYMS:
+            continue
+
+        def synonymfilter(n):
+            return stream is streams[n] and n is not name
+
+        synonyms = list(filter(synonymfilter, streams.keys()))
+
+        if len(synonyms) > 0:
+            joined = delimiter.join(synonyms)
+            name = "{0} ({1})".format(name, joined)
+
+        validstreams.append(name)
+
+    return delimiter.join(validstreams)
+
+
+def test_stream(plugin, args, stream):
+    prebuffer = None
+    retry_open = args.retry_open if True else 1
+    for i in list(range(retry_open)):
+        stream_fd = None
+        try:
+            stream_fd = stream.open()
+            LOGGER.debug("Pre-buffering 8192 bytes")
+            prebuffer = stream_fd.read(8192)
+        except StreamError as err:
+            LOGGER.error("Try {0}/{1}: Could not open stream {2} ({3})".format(i + 1, retry_open, stream, err))
+            return stream_fd, prebuffer
+        except IOError as err:
+            stream_fd.close()
+            LOGGER.error("Failed to read data from stream: {0}".format(err))
+        else:
+            break
+
+    if not prebuffer:
+        if stream_fd is not None:
+            stream_fd.close()
+        LOGGER.error("No data returned from stream")
+
+    return stream_fd, prebuffer
+
+
+def log_current_arguments(streamlink, args, url, quality):
+    global PARSER, LOGGER
+
+    if not logger.root.isEnabledFor(logging.DEBUG):
+        return
+
+    sensitive = set()
+    for pname, plugin in iteritems(streamlink.plugins):
+        for parg in plugin.arguments or []:
+            if parg.sensitive:
+                sensitive.add(parg.argument_name(pname))
+
+    LOGGER.debug("Arguments:")
+    LOGGER.debug(" url={0}".format(url))
+    LOGGER.debug(" stream={0}".format(quality.split(",")))
+    for action in PARSER._actions:
+        if not hasattr(args, action.dest):
+            continue
+        value = getattr(args, action.dest)
+        if action.default != value:
+            name = next(  # pragma: no branch
+                (option for option in action.option_strings if option.startswith("--")),
+                action.option_strings[0]
+            ) if action.option_strings else action.dest
+            LOGGER.debug(" {0}={1}".format(name, value if name not in sensitive else '*' * 8))
+
+
+def sendHeaders(http, status=200, type="text/html"):
+    http.send_response(status)
+    http.send_header("Server", "Enigma2 Streamlink")
+    http.send_header("Content-type", type)
+    http.end_headers()
+
+
+def sendOfflineMP4(http, send_headers=True):
+    LOGGER.debug("Send Offline clip")
+    if send_headers:
+        sendHeaders(http, type="video/mp4")
+
+    http.wfile.write(open("/usr/share/offline.mp4", "rb").read())
+
+
+def stream_to_url(stream):
+    try:
+        return stream.to_url()
+    except TypeError:
+        return None
+
+
+class ArgumentParser(argparse.ArgumentParser):
+    def __init__(self, *args, **kwargs):
+        self.NESTED_ARGUMENT_GROUPS = {}
+        super().__init__(*args, **kwargs)
+
+    def add_argument_group(
+        self,
+        *args,
+        parent = None,
+        **kwargs,
+    ):
+        group = super().add_argument_group(*args, **kwargs)
+        if parent not in self.NESTED_ARGUMENT_GROUPS:
+            self.NESTED_ARGUMENT_GROUPS[parent] = [group]
+        else:
+            self.NESTED_ARGUMENT_GROUPS[parent].append(group)
+        return group
+
+    def convert_arg_line_to_args(self, line):
+        match = _printable_re.search(line)
+        if not match:
+            return
+        line = line[match.start():].strip()
+
+        # Skip lines that do not start with a valid option (e.g. comments)
+        option = _option_re.match(line)
+        if not option:
+            return
+
+        name, value = option.group("name", "value")
+        if name and value:
+            yield "--{0}={1}".format(name, value)
+        elif name:
+            yield "--{0}".format(name)
+
+    def error(self, message):
+        LOGGER.error(message)
+
+
+class HelpFormatter(argparse.RawDescriptionHelpFormatter):
+    def __init__(self, max_help_position=4, *args, **kwargs):
+        # A smaller indent for args help.
+        kwargs["max_help_position"] = max_help_position
+        argparse.RawDescriptionHelpFormatter.__init__(self, *args, **kwargs)
+
+    def _split_lines(self, text, width):
+        text = dedent(text).strip() + "\n\n"
+        return text.splitlines()
+
+
+def build_parser():
+    global PARSER
+    PARSER = ArgumentParser(
+        fromfile_prefix_chars="@",
+        formatter_class=HelpFormatter,
+        add_help=False,
+        usage="%(prog)s [OPTIONS] <URL> [STREAM]",
+        description=dedent("""
+        Streamlink is command-line utility that extracts streams from
+        various services and pipes them into a video player of choice.
+        """),
+        epilog=dedent("""
+        For more in-depth documentation see:
+        https://streamlink.github.io
+        Please report broken plugins or bugs to the issue tracker on Github:
+        https://github.com/streamlink/streamlink/issues
+        """)
+    )
+
+    general = PARSER.add_argument_group("General options")
+    general.add_argument(
+        "-h", "--help",
+        action="store_true",
+    )
+    general.add_argument(
+        "--locale",
+        type=str,
+        metavar="LOCALE",
+    )
+    general.add_argument(
+        "-l", "--loglevel",
+        metavar="LEVEL",
+        choices=logger.levels,
+        default=DEFAULT_LEVEL,
+    )
+    general.add_argument(
+        "--logfile",
+        metavar="FILE",
+    )
+    general.add_argument(
+        "--interface",
+        type=str,
+        metavar="INTERFACE",
+    )
+    general.add_argument(
+        "-4", "--ipv4",
+        action="store_true",
+    )
+    general.add_argument(
+        "-6", "--ipv6",
+        action="store_true",
+    )
+
+    player = PARSER.add_argument_group("Player options")
+    player.add_argument(
+        "--player-passthrough",
+        metavar="TYPES",
+        type=comma_list_filter(STREAM_PASSTHROUGH),
+        default=[],
+    )
+
+    http = PARSER.add_argument_group("HTTP options")
+    http.add_argument(
+        "--http-proxy",
+        metavar="HTTP_PROXY",
+    )
+    http.add_argument(
+        "--https-proxy",
+        metavar="HTTPS_PROXY",
+    )
+    http.add_argument(
+        "--http-cookie",
+        metavar="KEY=VALUE",
+        type=keyvalue,
+        action="append",
+    )
+    http.add_argument(
+        "--http-header",
+        metavar="KEY=VALUE",
+        type=keyvalue,
+        action="append",
+    )
+    http.add_argument(
+        "--http-query-param",
+        metavar="KEY=VALUE",
+        type=keyvalue,
+        action="append",
+    )
+    http.add_argument(
+        "--http-ignore-env",
+        action="store_true",
+    )
+    http.add_argument(
+        "--http-no-ssl-verify",
+        action="store_true",
+    )
+    http.add_argument(
+        "--http-disable-dh",
+        action="store_true",
+    )
+    http.add_argument(
+        "--http-ssl-cert",
+        metavar="FILENAME",
+    )
+    http.add_argument(
+        "--http-ssl-cert-crt-key",
+        metavar=("CRT_FILENAME", "KEY_FILENAME"),
+        nargs=2,
+    )
+    http.add_argument(
+        "--http-timeout",
+        metavar="TIMEOUT",
+        type=num(float, gt=0),
+    )
+
+    transport = PARSER.add_argument_group("Stream transport options")
+    transport.add_argument(
+        "--hds-live-edge",
+        type=num(float, gt=0),
+        metavar="SECONDS",
+    )
+    transport.add_argument("--hds-segment-attempts", help=argparse.SUPPRESS)
+    transport.add_argument("--hds-segment-threads", help=argparse.SUPPRESS)
+    transport.add_argument("--hds-segment-timeout", help=argparse.SUPPRESS)
+    transport.add_argument("--hds-timeout", help=argparse.SUPPRESS)
+    transport.add_argument(
+        "--hls-live-edge",
+        type=num(int, ge=1),
+        metavar="SEGMENTS",
+    )
+    transport.add_argument("--hls-segment-stream-data", action="store_true", help=argparse.SUPPRESS)
+    transport.add_argument(
+        "--hls-playlist-reload-attempts",
+        type=num(int, ge=1),
+        metavar="ATTEMPTS",
+    )
+    transport.add_argument(
+        "--hls-playlist-reload-time",
+        metavar="TIME",
+    )
+    transport.add_argument("--hls-segment-attempts", help=argparse.SUPPRESS)
+    transport.add_argument("--hls-segment-threads", help=argparse.SUPPRESS)
+    transport.add_argument("--hls-segment-timeout", help=argparse.SUPPRESS)
+    transport.add_argument(
+        "--hls-segment-ignore-names",
+        metavar="NAMES",
+        type=comma_list,
+    )
+    transport.add_argument(
+        "--hls-segment-key-uri",
+        metavar="URI",
+        type=str,
+    )
+    transport.add_argument(
+        "--hls-audio-select",
+        type=comma_list,
+        metavar="CODE",
+    )
+    transport.add_argument("--hls-timeout", help=argparse.SUPPRESS)
+    transport.add_argument(
+        "--hls-start-offset",
+        type=hours_minutes_seconds,
+        metavar="HH:MM:SS",
+        default=None,
+    )
+    transport.add_argument(
+        "--hls-duration",
+        type=hours_minutes_seconds,
+        metavar="HH:MM:SS",
+        default=None,
+    )
+    transport.add_argument(
+        "--hls-live-restart",
+        action="store_true",
+    )
+    transport.add_argument(
+        "--http-add-audio",
+        metavar="URL",
+    )
+    transport.add_argument("--http-stream-timeout", help=argparse.SUPPRESS)
+    transport.add_argument(
+        "--ringbuffer-size",
+        metavar="SIZE",
+        type=filesize,
+    )
+    transport.add_argument(
+        "--rtmp-proxy",
+        metavar="PROXY",
+    )
+    transport.add_argument(
+        "--rtmp-rtmpdump",
+        metavar="FILENAME",
+    )
+    transport.add_argument("--rtmpdump", help=argparse.SUPPRESS)
+    transport.add_argument("--rtmp-timeout", help=argparse.SUPPRESS)
+    transport.add_argument(
+        "--stream-segment-attempts",
+        type=num(int, ge=1),
+        metavar="ATTEMPTS",
+    )
+    transport.add_argument(
+        "--stream-segment-threads",
+        type=num(int, ge=1, le=10),
+        metavar="THREADS",
+    )
+    transport.add_argument(
+        "--stream-segment-timeout",
+        type=num(float, gt=0),
+        metavar="TIMEOUT",
+    )
+    transport.add_argument(
+        "--stream-timeout",
+        type=num(float, gt=0),
+        metavar="TIMEOUT",
+    )
+    transport.add_argument(
+        "--subprocess-errorlog",
+        action="store_true",
+    )
+    transport.add_argument(
+        "--subprocess-errorlog-path",
+        type=str,
+        metavar="PATH",
+    )
+    transport.add_argument(
+        "--ffmpeg-ffmpeg",
+        metavar="FILENAME",
+    )
+    transport.add_argument(
+        "--ffmpeg-verbose",
+        action="store_true",
+    )
+    transport.add_argument(
+        "--ffmpeg-verbose-path",
+        type=str,
+        metavar="PATH",
+    )
+    transport.add_argument(
+        "--ffmpeg-fout",
+        type=str,
+        metavar="OUTFORMAT",
+    )
+    transport.add_argument(
+        "--ffmpeg-video-transcode",
+        metavar="CODEC",
+    )
+    transport.add_argument(
+        "--ffmpeg-audio-transcode",
+        metavar="CODEC",
+    )
+    transport.add_argument(
+        "--ffmpeg-copyts",
+        action="store_true",
+    )
+    transport.add_argument(
+        "--ffmpeg-start-at-zero",
+        action="store_true",
+    )
+    transport.add_argument(
+        "--mux-subtitles",
+        action="store_true",
+    )
+
+    stream = PARSER.add_argument_group("Stream options")
+    stream.add_argument(
+        "--default-stream",
+        type=comma_list,
+        metavar="STREAM",
+    )
+    stream.add_argument(
+        "--stream-types", "--stream-priority",
+        metavar="TYPES",
+        type=comma_list,
+    )
+    stream.add_argument(
+        "--stream-sorting-excludes",
+        metavar="STREAMS",
+        type=comma_list,
+    )
+    stream.add_argument(
+        "--retry-open",
+        metavar="ATTEMPTS",
+        type=num(int, ge=1),
+        default=1,
+    )
+
+    return PARSER
+
+
+def setupTransportOpts(streamlink, args):
+    """Sets Streamlink options."""
+    if args.interface:
+        streamlink.set_option("interface", args.interface)
+
+    if args.ipv4:
+        streamlink.set_option("ipv4", args.ipv4)
+
+    if args.ipv6:
+        streamlink.set_option("ipv6", args.ipv6)
+
+    if args.hls_live_edge:
+        streamlink.set_option("hls-live-edge", args.hls_live_edge)
+
+    if args.hls_playlist_reload_attempts:
+        streamlink.set_option("hls-playlist-reload-attempts", args.hls_playlist_reload_attempts)
+
+    if args.hls_playlist_reload_time:
+        streamlink.set_option("hls-playlist-reload-time", args.hls_playlist_reload_time)
+
+    if args.hls_segment_ignore_names:
+        streamlink.set_option("hls-segment-ignore-names", args.hls_segment_ignore_names)
+
+    if args.hls_segment_key_uri:
+        streamlink.set_option("hls-segment-key-uri", args.hls_segment_key_uri)
+
+    if args.hls_audio_select:
+        streamlink.set_option("hls-audio-select", args.hls_audio_select)
+
+    if args.hls_start_offset:
+        streamlink.set_option("hls-start-offset", args.hls_start_offset)
+
+    if args.hls_duration:
+        streamlink.set_option("hls-duration", args.hls_duration)
+
+    if args.hls_live_restart:
+        streamlink.set_option("hls-live-restart", args.hls_live_restart)
+
+    if args.hds_live_edge:
+        streamlink.set_option("hds-live-edge", args.hds_live_edge)
+
+    if args.http_add_audio:
+        streamlink.set_option("http-add-audio", args.http_add_audio)
+
+    if args.ringbuffer_size:
+        streamlink.set_option("ringbuffer-size", args.ringbuffer_size)
+
+    if args.rtmp_proxy:
+        streamlink.set_option("rtmp-proxy", args.rtmp_proxy)
+
+    if args.rtmp_rtmpdump:
+        streamlink.set_option("rtmp-rtmpdump", args.rtmp_rtmpdump)
+    elif args.rtmpdump:
+        streamlink.set_option("rtmp-rtmpdump", args.rtmpdump)
+
+    # deprecated
+    if args.hds_segment_attempts:
+        streamlink.set_option("hds-segment-attempts", args.hds_segment_attempts)
+    if args.hds_segment_threads:
+        streamlink.set_option("hds-segment-threads", args.hds_segment_threads)
+    if args.hds_segment_timeout:
+        streamlink.set_option("hds-segment-timeout", args.hds_segment_timeout)
+    if args.hds_timeout:
+        streamlink.set_option("hds-timeout", args.hds_timeout)
+    if args.hls_segment_attempts:
+        streamlink.set_option("hls-segment-attempts", args.hls_segment_attempts)
+    if args.hls_segment_threads:
+        streamlink.set_option("hls-segment-threads", args.hls_segment_threads)
+    if args.hls_segment_timeout:
+        streamlink.set_option("hls-segment-timeout", args.hls_segment_timeout)
+    if args.hls_timeout:
+        streamlink.set_option("hls-timeout", args.hls_timeout)
+    if args.http_stream_timeout:
+        streamlink.set_option("http-stream-timeout", args.http_stream_timeout)
+
+    if args.rtmp_timeout:
+        streamlink.set_option("rtmp-timeout", args.rtmp_timeout)
+
+    # generic stream- arguments take precedence over deprecated stream-type arguments
+    if args.stream_segment_attempts:
+        streamlink.set_option("stream-segment-attempts", args.stream_segment_attempts)
+
+    if args.stream_segment_threads:
+        streamlink.set_option("stream-segment-threads", args.stream_segment_threads)
+
+    if args.stream_segment_timeout:
+        streamlink.set_option("stream-segment-timeout", args.stream_segment_timeout)
+
+    if args.stream_timeout:
+        streamlink.set_option("stream-timeout", args.stream_timeout)
+
+    if args.ffmpeg_ffmpeg:
+        streamlink.set_option("ffmpeg-ffmpeg", args.ffmpeg_ffmpeg)
+    if args.ffmpeg_verbose:
+        streamlink.set_option("ffmpeg-verbose", args.ffmpeg_verbose)
+    if args.ffmpeg_verbose_path:
+        streamlink.set_option("ffmpeg-verbose-path", args.ffmpeg_verbose_path)
+    if args.ffmpeg_fout:
+        streamlink.set_option("ffmpeg-fout", args.ffmpeg_fout)
+    if args.ffmpeg_video_transcode:
+        streamlink.set_option("ffmpeg-video-transcode", args.ffmpeg_video_transcode)
+    if args.ffmpeg_audio_transcode:
+        streamlink.set_option("ffmpeg-audio-transcode", args.ffmpeg_audio_transcode)
+    if args.ffmpeg_copyts:
+        streamlink.set_option("ffmpeg-copyts", True)
+    if args.ffmpeg_start_at_zero:
+        streamlink.set_option("ffmpeg-start-at-zero", False)
+
+    if args.mux_subtitles:
+        streamlink.set_option("mux-subtitles", args.mux_subtitles)
+
+    streamlink.set_option("subprocess-errorlog", args.subprocess_errorlog)
+    streamlink.set_option("subprocess-errorlog-path", args.subprocess_errorlog_path)
+    streamlink.set_option("locale", args.locale)
+
+
+def setupHttpSession(streamlink, args):
+    """Sets the global HTTP settings, such as proxy and headers."""
+    if args.http_proxy:
+        streamlink.set_option("http-proxy", args.http_proxy)
+
+    if args.https_proxy:
+        streamlink.set_option("https-proxy", args.https_proxy)
+
+    if args.http_cookie:
+        streamlink.set_option("http-cookies", dict(args.http_cookie))
+
+    if args.http_header:
+        streamlink.set_option("http-headers", dict(args.http_header))
+
+    if args.http_query_param:
+        streamlink.set_option("http-query-params", dict(args.http_query_param))
+
+    if args.http_ignore_env:
+        streamlink.set_option("http-trust-env", False)
+
+    if args.http_no_ssl_verify:
+        streamlink.set_option("http-ssl-verify", False)
+
+    if args.http_disable_dh:
+        streamlink.set_option("http-disable-dh", True)
+
+    if args.http_ssl_cert:
+        streamlink.set_option("http-ssl-cert", args.http_ssl_cert)
+
+    if args.http_ssl_cert_crt_key:
+        streamlink.set_option("http-ssl-cert", tuple(args.http_ssl_cert_crt_key))
+
+    if args.http_timeout:
+        streamlink.set_option("http-timeout", args.http_timeout)
+
+
+def setup_plugin_args(streamlink):
+    """Adds plugin argument data to the argument parser."""
+
+    plugin_args = PARSER.add_argument_group("Plugin options")
+    for pname, plugin in streamlink.plugins.items():
+        group = PARSER.add_argument_group(pname.capitalize(), parent=plugin_args)
+
+        for parg in plugin.arguments or []:
+            group.add_argument(parg.argument_name(pname), **parg.options)
+
+    return True
+
+
+def setup_plugin_options(streamlink, plugin, args):
+    if not plugin.arguments:
+        return Options()
+
+    defaults = {}
+    values = {}
+    required = {}
+
+    for parg in plugin.arguments:
+        defaults[parg.dest] = parg.default
+
+        if parg.options.get("help") == argparse.SUPPRESS:
+            continue
+
+        value = getattr(args, parg.namespace_dest(pluginname))
+        values[parg.dest] = value
+
+        if parg.required:
+            required[parg.name] = parg
+        # if the value is set, check to see if any of the required arguments are not set
+        if parg.required or value:
+            try:
+                for rparg in pluginclass.arguments.requires(parg.name):
+                    required[rparg.name] = rparg
+            except RuntimeError:
+                log.error(f"{pluginname} plugin has a configuration error and the arguments cannot be parsed")
+                break
+
+    options = Options(defaults)
+    options.update(values)
+
+    return options
+
+
+def setup_config_files(streamlink, url):
+    config_files = []
+    pluginclass = None
+
+    if url:
+        with ignored(NoPluginError):
+            pluginname, pluginclass, resolved_url = streamlink.resolve_url(url)
+            config_files += ["{0}.{1}".format(fn, pluginname) for fn in CONFIG_FILES]
+
+    for config_file in filter(os.path.isfile, CONFIG_FILES):
+        config_files.append(config_file)
+        break
+
+    return (config_files, pluginclass(streamlink, resolved_url))
+
+
+def setup_args(arglist, config_files=[], ignore_unknown=False):
+    for config_file in filter(os.path.isfile, config_files):
+        arglist.insert(0, "@" + config_file)
+
+    args, unknown = PARSER.parse_known_args(arglist)
+
+    if unknown and not ignore_unknown:
+        PARSER.error("unrecognized arguments: {0}".format(' '.join(unknown)))
+
+    return args
+
+
+def conv_argitems_to_arglist(argitems):
+    arglist = []
+    for item in argitems:
+        for option in PARSER.convert_arg_line_to_args(item):
+            arglist.append(option)
+
+    return arglist
+
+
+def Stream(streamlink, http, url, argstr, quality):
+    global PARSER, _loglevel
+
+    fd = None
+    not_stream_opened = True
+    try:
+        # setup plugin, http & stream specific options
+        args = plugin = None
+        if PARSER:
+            global PLUGIN_ARGS
+            if not PLUGIN_ARGS:
+                PLUGIN_ARGS = setup_plugin_args(streamlink)
+            config_files, plugin = setup_config_files(streamlink, url)
+            if config_files or argstr:
+                arglist = argsplit(" -{}".format(argstr[0])) if argstr else []
+                try:
+                    args = setup_args(arglist, config_files=config_files, ignore_unknown=False)
+                except Exception:
+                    return sendOfflineMP4(http, send_headers=not_stream_opened)
+                else:
+                    _loglevel = args.loglevel
+                    logger.root.setLevel(_loglevel)
+                    setupHttpSession(streamlink, args)
+                    setupTransportOpts(streamlink, args)
+
+        if LOGLEVEL in ["trace", "debug"]:
+            logger.root.setLevel(LOGLEVEL)
+
+        if not plugin:
+            plugin, resolved_url = streamlink.resolve_url(url)
+            plugin = plugin(resolved_url)
+
+        if PARSER and PLUGIN_ARGS and args:
+            setup_plugin_options(streamlink, plugin, args)
+            log_current_arguments(streamlink, args, url, quality)
+
+        LOGGER.info("Found matching plugin {0} for URL {1}".format(plugin.module, url))
+        if args:
+            streams = plugin.streams(stream_types=args.stream_types, sorting_excludes=args.stream_sorting_excludes)
+
+        if any((not streams, not args)):
+            LOGGER.error("No playable streams found on this URL: {0}".format(url))
+            return sendOfflineMP4(http, send_headers=not_stream_opened)
+
+        LOGGER.info("Available streams: {0}".format(format_valid_streams(plugin, streams)))
+        stream = None
+        for stream_name in (resolve_stream_name(streams, s.strip()) for s in quality.split(',')):
+            if stream_name in streams:
+                stream = True
+                break
+
+        if not stream:
+            if "best" in streams:
+                stream_name = "best"
+                LOGGER.info("The specified stream(s) '{0}' could not be found, using '{1}' stream".format(quality, stream_name))
+            else:
+                LOGGER.error("The specified stream(s) '{0}' could not be found".format(quality))
+                return sendOfflineMP4(http, send_headers=not_stream_opened)
+
+        if not stream_name.endswith("_alt") and stream_name not in STREAM_SYNONYMS:
+            def _name_contains_alt(k):
+                return k.startswith(stream_name) and "_alt" in k
+
+            alt_streams = list(filter(lambda k: _name_contains_alt(k), sorted(streams.keys())))
+        else:
+            alt_streams = []
+
+        if args.http_add_audio:
+            http_add_audio = HTTPStream(streamlink, args.http_add_audio)
+        else:
+            http_add_audio = False
+        prebuffer = None
+        stream_names = [stream_name] + alt_streams
+        for stream_name in stream_names:
+            stream = streams[stream_name]
+            stream_type = type(stream).shortname()
+
+            if http_add_audio and stream_type in ("hls", "http", "rtmp"):
+                stream = MuxedStream(streamlink, stream, http_add_audio, add_audio=True)
+                stream_type = "muxed-stream"
+
+            # forece passthrough for YT hls
+            player_passthrough = True if stream_type in ("hls") and plugin.module in ("youtube") else False
+
+            LOGGER.info("Opening stream: {0} ({1})".format(stream_name, stream_type))
+            if stream_type in args.player_passthrough or player_passthrough:
+                LOGGER.debug("301 Passthrough - URL: {0}".format(stream_to_url(stream)))
+                http.send_response(301)
+                http.send_header("Location", stream_to_url(stream))
+                return http.end_headers()
+
+            fd, prebuffer = test_stream(plugin, args, stream)
+            if prebuffer:
+                break
+
+        if not prebuffer:
+            raise StreamError("Could not open stream {0}, tried {1} times, exiting", stream, args.retry_open)
+
+        LOGGER.debug("Writing stream to player")
+        not_stream_opened = False
+        sendHeaders(http)
+        http.wfile.write(prebuffer)
+        shutil.copyfileobj(fd, http.wfile)
+    except NoPluginError:
+        LOGGER.error("No plugin can handle URL: {0}".format(url))
+        sendOfflineMP4(http, send_headers=not_stream_opened)
+    except (PluginError, FatalPluginError, StreamError, NoStreamsError) as err:
+        LOGGER.error(err)
+        sendOfflineMP4(http, send_headers=not_stream_opened)
+    except socket.error as err:
+        if err.errno != errno.EPIPE:
+            # Not a broken pipe
+            raise
+        else:
+            # player disconnected
+            LOGGER.info('Detected player disconnect')
+    except Exception as err:
+        if not_stream_opened and LOGLEVEL not in ("debug", "trace"):
+            LOGGER.error("Got exception: {0}".format(err))
+        else:
+            LOGGER.error("Got exception: {0}\n{1}".format(err, traceback.format_exc().splitlines()))
+
+        sendOfflineMP4(http, send_headers=not_stream_opened)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if fd:
+            LOGGER.info("Stream ended")
+            fd.close()
+            LOGGER.info("Closing currently open stream...")
+
+
+class Streamlink2(Streamlink):
+    _loaded_plugins = None
+
+    def load_builtin_plugins(self):
+        if self.__class__._loaded_plugins is not None:
+            self._update_loaded_plugins()
+        else:
+            self.load_plugins(plugins.__path__[0])
+            if os.path.isdir(PLUGINS_DIR):
+                self.load_ext_plugins([PLUGINS_DIR])
+            self.__class__._loaded_plugins = self.plugins.copy()
+
+    def _update_loaded_plugins(self):
+        self.plugins = self.__class__._loaded_plugins.copy()
+        for plugin in itervalues(self.plugins):
+            plugin.session = self
+
+    def load_ext_plugins(self, dirs):
+        dirs = [os.path.expanduser(d) for d in dirs]
+        for directory in dirs:
+            if os.path.isdir(directory):
+                self.load_plugins(directory)
+            else:
+                LOGGER.warning("Plugin path {0} does not exist or is not a directory!".format(directory))
+
+
+class StreamHandler(BaseHTTPRequestHandler):
+
+    def do_HEAD(s):
+        sendHeaders(s)
+
+    def do_GET(s):
+        url = unquote(s.path[1:])
+        quality = "best"
+
+        if url.startswith("q=") and url.index("/") > 0:
+            i = url.index("/")
+            quality = url[2:i]
+            quality = quality.replace(" ", "")
+            url = url[i + 1:]
+        url = url.split(' -', 1)
+        LOGGER.trace("Processing URL: {0}".format(url[0].strip()))
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            streamlink = Streamlink2()
+
+        return Stream(streamlink, s, url[0].strip(), url[1:2], quality)
+
+    def finish(self, *args, **kw):
+        try:
+            if not self.wfile.closed:
+                self.wfile.flush()
+                self.wfile.close()
+        except socket.error:
+            pass
+        self.rfile.close()
+
+    def handle(self):
+        try:
+            BaseHTTPRequestHandler.handle(self)
+        except socket.error:
+            pass
+
+    if LOGLEVEL not in ("trace",):
+        def log_message(self, format, *args):
+            return
+
+
+class ThreadedHTTPServer(ForkingMixIn, HTTPServer):
+    """Handle requests in a separate thread."""
+
+
+def start():
+    def setup_logging(stream=sys.stdout, level="info"):
+        fmt = ("[{asctime},{msecs:0.0f}]" if level == "trace" else "") + "[{name}][{levelname}] {message}"
+        logger.basicConfig(stream=stream, level=level, format=fmt, style="{", datefmt="%H:%M:%S")
+
+    global LOGGER, PARSER
+    setup_logging(level=LOGLEVEL)
+    PARSER = build_parser()
+
+    httpd = ThreadedHTTPServer(("", PORT_NUMBER), StreamHandler)
+    LOGGER.info(" {0} Server ({1}) started".format(time.asctime(), __version__))
+    LOGGER.debug("Host:           {0}".format(hostname()))
+    LOGGER.debug("Port:           {0}".format(PORT_NUMBER))
+    LOGGER.debug("OS:             {0}".format(platform.platform()))
+    LOGGER.debug("Python:         {0}".format(platform.python_version()))
+    LOGGER.info(" Streamlink:     {0}".format(streamlink_version))
+    LOGGER.debug("youtube-dl:     {0}".format(ytdl_version))
+    LOGGER.debug("optparser:      {0}".format(__optparserversion__))
+    LOGGER.debug("Requests({0}), Socks({1}), Websocket({2})".format(requests_version, socks_version, websocket_version))
+
+    streamlink = Streamlink2()
+    del streamlink
+    signal.signal(signal.SIGTSTP, signal.default_int_handler)
+    signal.signal(signal.SIGQUIT, signal.default_int_handler)
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
+
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        LOGGER.info("Interrupted! Exiting...")
+    httpd.server_close()
+    LOGGER.info("{0} Server stopped - Host: {1}, Port: {2}".format(time.asctime(), hostname(), PORT_NUMBER))
+
+
+class Daemon:
+    """
+    A generic daemon class.
+
+    Usage: subclass the Daemon class and override the run() method
+    """
+
+    def __init__(self, pidfile, stdin="/dev/null", stdout="/dev/null", stderr="/dev/null"):
+        self.stdin = stdin
+        self.stdout = stdout
+        self.stderr = stderr
+        self.pidfile = pidfile
+
+    def daemonize(self):
+        """
+        do the UNIX double-fork magic, see Stevens' "Advanced
+        Programming in the UNIX Environment" for details (ISBN 0201563177)
+        http://www.erlenstar.demon.co.uk/unix/faq_2.html#SEC16
+        """
+        try:
+            pid = os.fork()
+            if pid > 0:
+                # exit first parent
+                sys.exit(0)
+        except OSError as e:
+            sys.stderr.write("fork #1 failed: %d (%s)\n" % (e.errno, e.strerror))
+            sys.exit(1)
+
+        # decouple from parent environment
+        os.chdir("/")
+        os.setsid()
+        os.umask(0)
+
+        # do second fork
+        try:
+            pid = os.fork()
+            if pid > 0:
+                # exit from second parent
+                sys.exit(0)
+        except OSError as e:
+            sys.stderr.write("fork #2 failed: %d (%s)\n" % (e.errno, e.strerror))
+            sys.exit(1)
+
+        # redirect standard file descriptors
+        sys.stdout.flush()
+        sys.stderr.flush()
+        si = open(self.stdin, "r")
+        so = open(self.stdout, "a+")
+        se = open(self.stderr, "a+")
+        os.dup2(si.fileno(), sys.stdin.fileno())
+        os.dup2(so.fileno(), sys.stdout.fileno())
+        os.dup2(se.fileno(), sys.stderr.fileno())
+
+        # write pidfile
+        atexit.register(self.delpid)
+        pid = str(os.getpid())
+        open(self.pidfile, "w+").write("%s\n" % pid)
+
+    def delpid(self):
+        os.remove(self.pidfile)
+
+    def start(self):
+        """
+        Start the daemon
+        """
+        # Check for a pidfile to see if the daemon already runs
+        try:
+            pf = open(self.pidfile, "r")
+            pid = int(pf.read().strip())
+            pf.close()
+        except IOError:
+            pid = None
+
+        if pid:
+            message = "pidfile %s already exist. Daemon already running?\n"
+            sys.stderr.write(message % self.pidfile)
+            sys.exit(1)
+
+        # Start the daemon
+        self.daemonize()
+        self.run()
+
+    def stop(self):
+        """
+        Stop the daemon
+        """
+        # Get the pid from the pidfile
+        try:
+            pf = open(self.pidfile, "r")
+            pid = int(pf.read().strip())
+            pf.close()
+        except IOError:
+            pid = None
+
+        if not pid:
+            message = "pidfile %s does not exist. Daemon not running?\n"
+            sys.stderr.write(message % self.pidfile)
+            return  # not an error in a restart
+
+        # Try killing the daemon process
+        try:
+            while 1:
+                os.kill(pid, signal.SIGTERM)
+                time.sleep(0.1)
+        except OSError as err:
+            err = str(err)
+            if err.find("No such process") > 0:
+                if os.path.exists(self.pidfile):
+                    os.remove(self.pidfile)
+            else:
+                print(str(err))
+                sys.exit(1)
+
+    def restart(self):
+        """
+        Restart the daemon
+        """
+        self.stop()
+        self.start()
+
+    def run(self):
+        """
+        You should override this method when you subclass Daemon. It will be called after the process has been
+        daemonized by start() or restart().
+        """
+
+
+class StreamlinkDaemon(Daemon):
+    def run(self):
+        start()
+
+
+if __name__ == "__main__":
+    daemon = StreamlinkDaemon("/var/run/streamlink.pid")
+    if len(sys.argv) >= 2:
+        if "start" == sys.argv[1]:
+            daemon.start()
+        elif "stop" == sys.argv[1]:
+            daemon.stop()
+        elif "restart" == sys.argv[1]:
+            daemon.restart()
+        elif "manualstart" == sys.argv[1]:
+            daemon.stop()
+            if len(sys.argv) > 2 and sys.argv[2] in ("debug", "trace"):
+                _loglevel = LOGLEVEL = sys.argv[2]
+            start()
+        else:
+            print("Unknown command")
+            sys.exit(2)
+        sys.exit(0)
+    else:
+        print("usage: %s start|stop|restart|manualstart" % sys.argv[0])
+        print("		  manualstart include a stop")
+        sys.exit(2)
